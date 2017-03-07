@@ -290,6 +290,7 @@ Before:
       throw 'There were '.len(jobs).' jobs left: '.string(map(jobs, 'v:val.make_id.".".v:val.id'))
     endif
 
+    Assert empty(neomake#GetStatus().make_info), 'make_info is not empty: '.string(neomake#GetStatus().make_info)
     NeomakeTestsWaitForRemovedJobs
 
     if exists('#neomake_tests')

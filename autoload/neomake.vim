@@ -53,6 +53,7 @@ endfunction
 function! neomake#GetStatus() abort
     return {
                 \ 'last_make_id': s:make_id,
+                \ 'make_info': s:make_info,
                 \ }
 endfunction
 
@@ -76,24 +77,21 @@ function! neomake#CancelJob(job_id, ...) abort
         call neomake#utils#ErrorMessage('CancelJob: job not found: '.job_id)
         return 0
     endif
+    let ret = 0
     let jobinfo = s:jobs[job_id]
     if get(jobinfo, 'finished')
-        call neomake#utils#DebugMessage('Removing already finished job: '.job_id)
-        call s:CleanJobinfo(jobinfo)
+        call neomake#utils#DebugMessage('Removing already finished job', jobinfo)
     else
-        if remove_always
-            unlet s:jobs[job_id]
-        endif
         " Mark it as canceled for the exit handler.
         let jobinfo.canceled = 1
         call neomake#utils#DebugMessage('Stopping job', jobinfo)
         if has('nvim')
             try
                 call jobstop(job_id)
+                let ret = 1
             catch /^Vim\%((\a\+)\)\=:\(E474\|E900\):/
                 call neomake#utils#LoudMessage(printf(
                             \ 'jobstop failed: %s', v:exception), jobinfo)
-                return 0
             endtry
         else
             let vim_job = jobinfo.vim_job
@@ -102,12 +100,16 @@ function! neomake#CancelJob(job_id, ...) abort
             if ch_status(vim_job) !=# 'open'
                 call neomake#utils#LoudMessage(
                             \ 'job_stop: job was not running anymore', jobinfo)
-                return 0
+            else
+                call job_stop(vim_job)
+                let ret = 1
             endif
-            call job_stop(vim_job)
         endif
     endif
-    return 1
+    if ret == 0 || remove_always
+        call s:CleanJobinfo(jobinfo)
+    endif
+    return ret
 endfunction
 
 function! neomake#CancelJobs(bang) abort
@@ -178,12 +180,9 @@ function! s:MakeJob(make_id, options) abort
                         \ 'Restarting already running job (%d.%d) for the same maker.',
                         \ jobinfo.make_id, jobinfo.id), {'make_id': s:make_id})
             let jobinfo.restarting = s:make_id
-            if neomake#CancelJob(jobinfo.id)
-                return -2
-            endif
-            " Previous job was not running anymore, and we are not being
-            " restarted through its exit handler.
-            return s:MakeJob(a:make_id, a:options)
+
+            call neomake#CancelJob(jobinfo.id)
+            return s:MakeJob(s:make_id, a:options)
         endif
     endif
 
@@ -305,6 +304,12 @@ function! s:MakeJob(make_id, options) abort
             exe cd fnameescape(old_wd)
         endif
     endtry
+    if r != -1
+        if r != jobinfo.id
+            throw printf('Neomake: unexpected job id (%d/%d)', r, jobinfo.id)
+        endif
+        let s:make_info[s:make_id].active_jobs[jobinfo.id] = jobinfo
+    endif
     return r
 endfunction
 
@@ -623,6 +628,8 @@ function! s:Make(options) abort
         let s:make_info[s:make_id] = {
                     \ 'cwd': getcwd(),
                     \ 'verbosity': get(g:, 'neomake_verbose', 1) + &verbose,
+                    \ 'active_jobs': {},
+                    \ 'finished_jobs': [],
                     \ }
 
         if !has_key(options, 'enabled_makers')
@@ -630,6 +637,7 @@ function! s:Make(options) abort
             if !len(makers)
                 if file_mode
                     call neomake#utils#DebugMessage('Nothing to make: no enabled file mode makers.', {'make_id': s:make_id})
+                    unlet s:make_info[s:make_id]
                     return []
                 else
                     let makers = ['makeprg']
@@ -657,6 +665,7 @@ function! s:Make(options) abort
     let enabled_makers = call('s:map_makers', args)
     if !len(enabled_makers)
         call neomake#utils#DebugMessage('Nothing to make: no valid makers.')
+        unlet s:make_info[s:make_id]
         return []
     endif
 
@@ -718,6 +727,9 @@ function! s:Make(options) abort
             break
         endif
     endwhile
+    if !len(job_ids)
+        unlet s:make_info[s:make_id]
+    endif
     return job_ids
 endfunction
 
@@ -844,7 +856,7 @@ endfunction
 function! s:CleanJobinfo(jobinfo) abort
     call neomake#utils#DebugMessage('Cleaning jobinfo', a:jobinfo)
 
-    if has_key(a:jobinfo, 'id')
+    if has_key(s:jobs, a:jobinfo.id)
         call remove(s:jobs, a:jobinfo.id)
 
         let [t, w] = s:GetTabWinForMakeId(a:jobinfo.make_id)
@@ -857,11 +869,22 @@ function! s:CleanJobinfo(jobinfo) abort
         endif
     endif
 
-    call neomake#utils#hook('NeomakeJobFinished', {'jobinfo': a:jobinfo})
+    let make_info = s:make_info[a:jobinfo.make_id]
+    let was_restarted = get(a:jobinfo, 'restarting', 0)
+    if !was_restarted
+        call neomake#utils#hook('NeomakeJobFinished', {'jobinfo': a:jobinfo})
+        call add(make_info.finished_jobs, a:jobinfo.id)
+    endif
+
+    let active_jobs = make_info.active_jobs
+    call remove(active_jobs, a:jobinfo.id)
 
     " Trigger autocmd if all jobs for a s:Make instance have finished.
-    if !len(filter(copy(s:jobs), 'v:val.make_id == a:jobinfo.make_id'
-                \ . "|| get(v:val, 'restarting', 0) == a:jobinfo.make_id"))
+    if len(active_jobs)
+        return
+    endif
+
+    if len(make_info.finished_jobs)
         call s:init_job_output(a:jobinfo)
 
         " If signs were not cleared before this point, then the maker did not return
@@ -888,6 +911,7 @@ function! s:CleanJobinfo(jobinfo) abort
                     \ 'file_mode': a:jobinfo.file_mode,
                     \ 'make_id': a:jobinfo.make_id}, a:jobinfo)
     endif
+    unlet s:make_info[a:jobinfo.make_id]
 endfunction
 
 function! s:CanProcessJobOutput() abort
@@ -1214,9 +1238,8 @@ function! s:exit_handler(job_id, data, event_type) abort
     endif
     let jobinfo = s:jobs[a:job_id]
     if get(jobinfo, 'restarting')
-        call neomake#utils#DebugMessage('exit: job is restarting.', jobinfo)
-        call s:MakeJob(jobinfo.restarting, jobinfo)
-        call remove(s:jobs, jobinfo.id)
+        call neomake#utils#DebugMessage('exit: job was restarted.', jobinfo)
+        call s:CleanJobinfo(jobinfo)
         return
     endif
     if get(jobinfo, 'canceled')

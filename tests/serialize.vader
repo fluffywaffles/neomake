@@ -107,7 +107,9 @@ Execute (Neomake#Make cancels previous jobs):
     let first_jobs = neomake#GetJobs(neomake#Make(0, [g:sleep_maker, g:maker_error]))
     let make_id = neomake#GetStatus().last_make_id
     call neomake#Make(0, [g:sleep_maker, g:maker_error])
+    AssertEqual has_key(neomake#GetStatus().make_info, make_id), 1
     NeomakeTestsWaitForFinishedJobs
+    AssertEqual has_key(neomake#GetStatus().make_info, make_id), 0
     AssertEqual len(g:neomake_test_jobfinished), 2
     AssertEqual len(g:neomake_test_finished), 1
     AssertEqual map(copy(getqflist()), 'v:val.text'), ['error', 'slept']
@@ -123,6 +125,26 @@ Execute (Neomake#Make cancels previous jobs):
     " Restarted job should use new make_id.
     AssertNeomakeMessage "Starting async job: ['/bin/bash', '-c', 'echo error; false']",
     \ 2, {'make_id': make_id+1}
+  endif
+
+Execute (Neomake#Make starts new jobs before waiting for the old to finish):
+  if NeomakeAsyncTestsSetup()
+    let start = reltime()
+    let maker = NeomakeTestsCommandMaker('sleep', 'sleep .5')
+    call neomake#Make(0, [maker])
+    call neomake#Make(0, [maker])
+    call neomake#Make(0, [maker])
+    call neomake#Make(0, [maker])
+    call neomake#Make(0, [maker])
+    NeomakeTestsWaitForFinishedJobs
+    let end = reltime()
+    let duration = reltimefloat(end) - reltimefloat(start)
+    Assert duration < 1.0, printf(
+    \ 'Jobs have been restarted before being stopped (%.2f).', duration)
+
+    let restart_messages = filter(copy(g:neomake_test_messages),
+        \ "v:val[1] =~# '\\vRestarting already running job \\(\\d.\\d\\) for the same maker.'")
+    AssertEqual len(restart_messages), 4, 'Jobs have been restarted'
   endif
 
 Execute (Neomake#Make does not cancel maker from same run):
